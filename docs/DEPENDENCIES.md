@@ -2,31 +2,49 @@
 
 This document tracks all dependencies installed during the self-hosted setup process.
 
-**Note**: All dependencies are now included in `.devcontainer/Dockerfile.project` for automatic installation when rebuilding the devcontainer.
+**Note**: Infrastructure services (PostgreSQL, Redis, MinIO) now run via Docker Compose. See the main `DEPENDENCIES.md` in the project root for installation instructions.
 
 ## System Packages
 
 ### Docker
-- **Package**: `docker.io`
-- **Installed via**: `apt-get install -y docker.io`
-- **Purpose**: Attempted for containerization but had WSL2 permission issues
-- **Status**: Installed but not used
-- **Alternative**: Installed services natively instead
+- **Package**: `docker-ce` or `docker.io`
+- **Purpose**: Runs infrastructure services (PostgreSQL, Redis, MinIO)
+- **Status**: Required - all infrastructure runs in containers
+
+### Node.js
+- **Package**: `nodejs` (v24+)
+- **Installed via**: nodesource repository
+- **Purpose**: Runtime for happy-server, happy-cli, and webapp
+
+### Yarn
+- **Package**: `yarn` (v1.22.22+)
+- **Installed via**: `npm install -g yarn`
+- **Purpose**: Package manager for all JavaScript projects
+
+## Infrastructure Services (via Docker Compose)
+
+All infrastructure services are defined in `docker-compose.yaml` and managed via:
+```bash
+docker compose up -d      # Start
+docker compose down       # Stop
+docker compose down -v    # Stop and remove data
+```
 
 ### PostgreSQL
-- **Package**: `postgresql`, `postgresql-contrib`
-- **Installed via**: `apt-get install -y postgresql postgresql-contrib`
-- **Purpose**: Database for happy-server
-- **Used by**: happy-server
-- **Database**: handy (auto-created by setup-postgres.sh)
-- **Setup**: Fully automated via `setup-postgres.sh` (see Setup Notes below)
+- **Image**: `postgres:17`
+- **Port**: 5432
+- **Database**: handy (created automatically)
+- **Credentials**: postgres/postgres
 
 ### Redis
-- **Package**: `redis-server`
-- **Installed via**: `apt-get install -y redis-server`
-- **Purpose**: Cache and pub/sub for happy-server
-- **Used by**: happy-server
+- **Image**: `redis:7-alpine`
 - **Port**: 6379
+
+### MinIO (S3-compatible storage)
+- **Image**: `minio/minio`
+- **Ports**: 9000 (API), 9001 (Console)
+- **Credentials**: minioadmin/minioadmin
+- **Bucket**: `happy` (created by minio-init container)
 
 ## Node.js Dependencies
 
@@ -40,48 +58,12 @@ This document tracks all dependencies installed during the self-hosted setup pro
 - Includes: Claude Code SDK, Socket.io client, TweetNaCl for encryption, etc.
 - See `/happy-cli/package.json` for full list
 
-## Services (Docker Containers)
-
-### PostgreSQL
-- **Image**: `postgres:latest`
-- **Port**: 5432
-- **Database**: handy
-- **Credentials**: postgres/postgres
-- **Started via**: `yarn db` in happy-server
-
-### Redis
-- **Image**: `redis:latest`
-- **Port**: 6379
-- **Started via**: `yarn redis` in happy-server
-
-### MinIO (S3-compatible storage)
-- **Binary**: MinIO standalone server
-- **Installed via**: `wget https://dl.min.io/server/minio/release/linux-amd64/minio`
-- **Ports**: 9000 (API), 9001 (Console)
-- **Credentials**: minioadmin/minioadmin
-- **Data directory**: `/happy-all-WinGamingPC/happy-server/.minio/data`
-- **Bucket**: `happy` (created with MinIO client)
-- **Started via**: `minio server .minio/data --address :9000 --console-address :9001`
-
-### MinIO Client (mc)
-- **Binary**: MinIO client for bucket management
-- **Installed via**: `wget https://dl.min.io/client/mc/release/linux-amd64/mc`
-- **Used for**: Creating and configuring S3 buckets
-
-### lsof
-- **Package**: `lsof`
-- **Installed via**: `apt-get install -y lsof`
-- **Purpose**: Used by happy-server dev script to kill existing processes on port 3005
-- **Used by**: happy-server
+### happy webapp
+- Installed via `yarn install` in `/happy/`
+- Includes: Expo, React Native, etc.
+- See `/happy/package.json` for full list
 
 ## Testing Scripts
-
-### setup-postgres.sh
-- **Location**: `/setup-postgres.sh`
-- **Purpose**: Automated PostgreSQL setup and verification script
-- **Checks**: Password configuration, database existence, schema migrations
-- **Usage**: `./setup-postgres.sh` (or called automatically by e2e-demo.sh)
-- **Features**: Idempotent - safe to run multiple times
 
 ### setup-test-credentials.mjs
 - **Location**: `/scripts/setup-test-credentials.mjs`
@@ -89,12 +71,11 @@ This document tracks all dependencies installed during the self-hosted setup pro
 - **Dependencies**: tweetnacl, axios (via symlink to happy-cli/node_modules)
 - **Creates**: Test credentials in `~/.happy-dev-test/`
 - **Usage**: `node scripts/setup-test-credentials.mjs`
-- **Note**: Kept outside happy-cli repo to avoid dirtying the system-under-test. Uses a symlink to happy-cli/node_modules for dependencies.
 
 ### e2e-demo.sh
 - **Location**: `/e2e-demo.sh`
 - **Purpose**: Complete e2e demo script that shows the full self-hosted flow
-- **Dependencies**: setup-postgres.sh, happy-launcher.sh, setup-test-credentials.mjs
+- **Dependencies**: happy-launcher.sh, setup-test-credentials.mjs
 - **Usage**: `./e2e-demo.sh`
 
 ## Environment Variables
@@ -115,47 +96,6 @@ scripts/
 
 This approach keeps the system-under-test repos (happy-cli, happy-server) clean while allowing test scripts to access necessary dependencies.
 
-## Setup Notes
-
-### PostgreSQL Initial Setup
-
-PostgreSQL setup is **fully automated** via the `setup-postgres.sh` script, which is called automatically by `e2e-demo.sh`.
-
-The setup script checks and fixes:
-1. PostgreSQL password configuration (sets to `postgres` if needed)
-2. Database existence (creates `handy` database if missing)
-3. Database schema (runs Prisma migrations if tables are missing)
-
-**Manual setup is no longer required.** Just run `./e2e-demo.sh` and it will handle everything.
-
-#### Manual Setup Script
-
-If you need to run the PostgreSQL setup manually:
-```bash
-./setup-postgres.sh
-```
-
-This script is idempotent - it's safe to run multiple times and will only make changes if needed.
-
-#### What the Script Does
-
-1. **Checks PostgreSQL is running** - Exits if PostgreSQL service is not started
-2. **Verifies password** - Sets `postgres` user password to `postgres` if not configured
-3. **Creates database** - Creates `handy` database if it doesn't exist
-4. **Runs migrations** - Executes Prisma migrations if database tables are missing
-
-The script expects:
-- Database credentials: `postgres:postgres@localhost:5432/handy` (as configured in happy-server/.env)
-- PostgreSQL service to be running (start with `service postgresql start`)
-
-### Common Issues
-
-**Issue**: "PostgreSQL is not running"
-**Solution**: Start PostgreSQL with `service postgresql start`
-
-**Issue**: Server fails to start with database errors
-**Solution**: Run `./setup-postgres.sh` manually to verify and fix setup
-
 ## Browser Automation (Playwright)
 
 ### Installation
@@ -173,14 +113,6 @@ npx playwright install chromium
 npx playwright install-deps chromium
 ```
 
-### System Packages Installed by Playwright
-
-The `playwright install-deps chromium` command installs:
-- `xvfb` - X Virtual Frame Buffer for headless display
-- `fonts-*` - Various fonts for proper text rendering
-- `libnss3`, `libnspr4` - Security libraries
-- Various X11 libraries for graphics rendering
-
 ### Browser Test Scripts
 
 Located in `/scripts/browser/`:
@@ -191,7 +123,7 @@ Located in `/scripts/browser/`:
 ### Usage
 
 ```bash
-cd /happy-all-WinGamingPC/scripts/browser
+cd scripts/browser
 
 # Basic inspection with screenshot
 node inspect-webapp.mjs --screenshot --console
@@ -204,10 +136,3 @@ node test-webapp-e2e.mjs "YOUR-SECRET-KEY"
 
 - `WEBAPP_URL` - Override webapp URL (default: `http://localhost:8081`)
 - `SCREENSHOT_DIR` - Directory for screenshots (default: `/tmp`)
-
-### Screenshots
-
-Screenshots are saved to `/tmp/` with timestamps:
-- `happy-e2e-01-initial-{timestamp}.png`
-- `happy-e2e-02-after-create-click-{timestamp}.png`
-- etc.

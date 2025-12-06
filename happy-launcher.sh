@@ -305,16 +305,64 @@ wait_for_port() {
 # Service Start Functions
 # =============================================================================
 
-ensure_postgres_ready() {
-    # Ensure postgres user has expected password
-    sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres';" > /dev/null 2>&1 || true
+# =============================================================================
+# Docker Compose Infrastructure
+# =============================================================================
 
+# Check if docker compose is available
+check_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        error "Docker is not installed. Please install Docker first."
+        error "See: https://docs.docker.com/get-docker/"
+        return 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        error "Docker daemon is not running. Please start Docker."
+        return 1
+    fi
+    return 0
+}
+
+# Start infrastructure services via docker compose
+start_docker_infra() {
+    info "Starting infrastructure via docker compose..."
+
+    # Start all infrastructure services
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" up -d postgres redis minio minio-init || {
+        error "Failed to start docker compose services"
+        return 1
+    }
+
+    # Wait for services to be healthy
+    wait_for_port "$POSTGRES_PORT" "PostgreSQL" 30 || {
+        error "PostgreSQL container failed to start"
+        return 1
+    }
+    wait_for_port "$REDIS_PORT" "Redis" 30 || {
+        error "Redis container failed to start"
+        return 1
+    }
+    wait_for_port "$MINIO_PORT" "MinIO" 30 || {
+        error "MinIO container failed to start"
+        return 1
+    }
+
+    success "Docker infrastructure started"
+}
+
+# Stop infrastructure services via docker compose
+stop_docker_infra() {
+    info "Stopping docker compose infrastructure..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" down || true
+}
+
+ensure_postgres_ready() {
     # Ensure slot-specific database exists
-    # - Slot 0: 'handy' (production)
+    # - Slot 0: 'handy' (production) - created by docker-compose
     # - Slot N: 'handy_test_N' (isolated test databases)
     if ! PGPASSWORD=postgres psql -U postgres -h localhost -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$DATABASE_NAME"; then
         info "Creating database '$DATABASE_NAME' for slot ${SLOT:-0}..."
-        sudo -u postgres psql -c "CREATE DATABASE $DATABASE_NAME;" > /dev/null 2>&1 || true
+        PGPASSWORD=postgres psql -U postgres -h localhost -c "CREATE DATABASE $DATABASE_NAME;" > /dev/null 2>&1 || true
     fi
 
     # Ensure database schema exists (run migrations if needed)
@@ -331,25 +379,20 @@ start_postgres() {
         ensure_postgres_ready
         return 0
     fi
-    if is_running "postgres.*17/main"; then
-        info "PostgreSQL process detected, waiting for port..."
-        wait_for_port "$POSTGRES_PORT" "PostgreSQL" 10 || {
-            error "PostgreSQL process running but port not responding"
-            return 1
-        }
-    else
-        info "Starting PostgreSQL..."
-        service postgresql start 2>/dev/null || {
-            error "Failed to start PostgreSQL service"
-            return 1
-        }
-        wait_for_port "$POSTGRES_PORT" "PostgreSQL" 10 || {
-            error "PostgreSQL failed to start"
-            return 1
-        }
-        ensure_postgres_ready
-        success "PostgreSQL started on port $POSTGRES_PORT"
-    fi
+
+    # Start via docker compose
+    check_docker || return 1
+    info "Starting PostgreSQL via docker compose..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" up -d postgres || {
+        error "Failed to start PostgreSQL container"
+        return 1
+    }
+    wait_for_port "$POSTGRES_PORT" "PostgreSQL" 30 || {
+        error "PostgreSQL failed to start"
+        return 1
+    }
+    ensure_postgres_ready
+    success "PostgreSQL started on port $POSTGRES_PORT (docker)"
 }
 
 start_redis() {
@@ -358,45 +401,39 @@ start_redis() {
         info "Redis is already running on port $REDIS_PORT"
         return 0
     fi
-    if is_running "redis-server"; then
-        info "Redis process detected, waiting for port..."
-        wait_for_port "$REDIS_PORT" "Redis" 10 || {
-            error "Redis process running but port not responding"
-            return 1
-        }
-    else
-        info "Starting Redis..."
-        redis-server --daemonize yes --port "$REDIS_PORT" 2>/dev/null || \
-            service redis-server start 2>/dev/null || true
-        wait_for_port "$REDIS_PORT" "Redis" 10 || {
-            error "Redis failed to start"
-            return 1
-        }
-        success "Redis started on port $REDIS_PORT"
-    fi
+
+    # Start via docker compose
+    check_docker || return 1
+    info "Starting Redis via docker compose..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" up -d redis || {
+        error "Failed to start Redis container"
+        return 1
+    }
+    wait_for_port "$REDIS_PORT" "Redis" 30 || {
+        error "Redis failed to start"
+        return 1
+    }
+    success "Redis started on port $REDIS_PORT (docker)"
 }
 
 start_minio() {
     if port_listening "$MINIO_PORT"; then
         info "MinIO is already running on port $MINIO_PORT"
-    else
-        info "Starting MinIO (slot ${SLOT:-0})..."
-        mkdir -p "$MINIO_DATA_DIR/data"
-        MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            minio server "$MINIO_DATA_DIR/data" --address ":${MINIO_PORT}" --console-address ":${MINIO_CONSOLE_PORT}" \
-            > "$LOG_DIR/minio.log" 2>&1 &
-        echo $! > "$PIDS_DIR/minio.pid"
-        wait_for_port "$MINIO_PORT" "MinIO" 15 || {
-            error "MinIO failed to start"
-            return 1
-        }
-        # Create bucket if mc is available
-        if command -v mc >/dev/null 2>&1; then
-            mc alias set "local-slot-${SLOT_SUFFIX}" "http://localhost:${MINIO_PORT}" minioadmin minioadmin 2>/dev/null || true
-            mc mb "local-slot-${SLOT_SUFFIX}/happy" 2>/dev/null || true
-        fi
-        success "MinIO started on port $MINIO_PORT (Console: $MINIO_CONSOLE_PORT)"
+        return 0
     fi
+
+    # Start via docker compose
+    check_docker || return 1
+    info "Starting MinIO via docker compose..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" up -d minio minio-init || {
+        error "Failed to start MinIO container"
+        return 1
+    }
+    wait_for_port "$MINIO_PORT" "MinIO" 30 || {
+        error "MinIO failed to start"
+        return 1
+    }
+    success "MinIO started on port $MINIO_PORT (Console: $MINIO_CONSOLE_PORT) (docker)"
 }
 
 start_server() {
@@ -503,9 +540,9 @@ stop_all() {
         fi
     done
 
-    # Note: Not stopping PostgreSQL and Redis as they're system services
-    warning "PostgreSQL and Redis are system services and were not stopped"
-    warning "To stop them manually: service postgresql stop && service redis-server stop"
+    # Note: Docker infrastructure services are managed separately
+    info "Docker infrastructure (postgres, redis, minio) left running"
+    info "To stop them: docker compose -f $SCRIPT_DIR/docker-compose.yaml down"
 }
 
 cleanup_slot() {
@@ -627,32 +664,14 @@ cleanup_all() {
         success "happy-server stopped"
     fi
 
-    # Stop any remaining MinIO processes
-    if is_running "minio server"; then
-        info "Stopping MinIO..."
-        pkill -f "minio server" || true
-        success "MinIO stopped"
-    fi
-
-    # Stop PostgreSQL
-    if is_running "postgres.*17/main"; then
-        info "Stopping PostgreSQL..."
-        service postgresql stop || true
-        success "PostgreSQL stopped"
-    fi
-
-    # Stop Redis
-    if is_running "redis-server"; then
-        info "Stopping Redis..."
-        service redis-server stop || true
-        pkill -f "redis-server" 2>/dev/null || true
-        success "Redis stopped"
-    fi
-
     # Kill any orphaned processes
     info "Cleaning up any orphaned processes..."
     pkill -f "node.*happy-server" 2>/dev/null || true
     pkill -f "node.*happy-cli" 2>/dev/null || true
+
+    # Stop docker compose infrastructure
+    info "Stopping docker compose infrastructure..."
+    docker compose -f "$SCRIPT_DIR/docker-compose.yaml" down 2>/dev/null || true
 
     echo ""
     success "Complete cleanup finished!"
@@ -676,29 +695,24 @@ show_slot_services_status() {
     local slot="$1"
 
     # Calculate ports for this slot
-    local server_port webapp_port minio_port minio_console_port metrics_port
-    local db_name pids_dir log_dir minio_data
+    local server_port webapp_port metrics_port
+    local db_name pids_dir log_dir
 
     if [[ "$slot" -eq 0 ]]; then
         server_port="${DEFAULT_SERVER_PORT}"
         webapp_port="${DEFAULT_WEBAPP_PORT}"
-        minio_port="${DEFAULT_MINIO_PORT}"
-        minio_console_port="${DEFAULT_MINIO_CONSOLE_PORT}"
         metrics_port="${DEFAULT_METRICS_PORT}"
         db_name="handy"
     else
         local offset=$(( (slot - 1) * SLOT_OFFSET ))
         server_port=$(( BASE_SERVER_PORT + offset ))
         webapp_port=$(( BASE_WEBAPP_PORT + offset ))
-        minio_port=$(( BASE_MINIO_PORT + offset ))
-        minio_console_port=$(( BASE_MINIO_CONSOLE_PORT + offset ))
         metrics_port=$(( BASE_METRICS_PORT + offset ))
         db_name="handy_test_${slot}"
     fi
 
     pids_dir="$SCRIPT_DIR/.pids-slot-${slot}"
     log_dir="/tmp/happy-slot-${slot}"
-    minio_data="$SERVER_DIR/.minio-slot-${slot}"
 
     echo "--- Slot $slot (DB: $db_name, Server: $server_port, Webapp: $webapp_port) ---"
 
@@ -714,19 +728,6 @@ show_slot_services_status() {
         fi
         return 1
     }
-
-    # MinIO (slot-specific)
-    if local_is_slot_service_running "minio"; then
-        if port_listening "$minio_port"; then
-            success "  MinIO: Running (API: $minio_port, Console: $minio_console_port)"
-        else
-            warning "  MinIO: Process exists but port not responding"
-        fi
-    elif port_listening "$minio_port"; then
-        success "  MinIO: Running (API: $minio_port, Console: $minio_console_port)"
-    else
-        notfound "  MinIO: Stopped"
-    fi
 
     # happy-server (slot-specific)
     if local_is_slot_service_running "server"; then
@@ -769,18 +770,18 @@ show_status() {
     echo "  Name:     $DATABASE_NAME"
     echo "  URL:      $DATABASE_URL"
     echo ""
-    echo "Shared services (all slots use same Postgres/Redis process):"
+    echo "Docker infrastructure (shared by all slots):"
     echo "  Postgres: $POSTGRES_PORT"
     echo "  Redis:    $REDIS_PORT"
+    echo "  MinIO:    $MINIO_PORT (Console: $MINIO_CONSOLE_PORT)"
     echo ""
     echo "Directories:"
-    echo "  MinIO data: $MINIO_DATA_DIR"
     echo "  Logs:       $LOG_DIR"
     echo "  PIDs:       $PIDS_DIR"
     echo ""
 
-    # Shared services (PostgreSQL and Redis)
-    echo "--- Shared Services ---"
+    # Docker infrastructure services
+    echo "--- Docker Infrastructure ---"
     if port_listening "$POSTGRES_PORT"; then
         success "PostgreSQL: Running (port $POSTGRES_PORT, database: $DATABASE_NAME)"
     else
@@ -788,9 +789,15 @@ show_status() {
     fi
 
     if port_listening "$REDIS_PORT"; then
-        success "Redis: Running (port $REDIS_PORT, shared)"
+        success "Redis: Running (port $REDIS_PORT)"
     else
         notfound "Redis: Stopped"
+    fi
+
+    if port_listening "$MINIO_PORT"; then
+        success "MinIO: Running (API: $MINIO_PORT, Console: $MINIO_CONSOLE_PORT)"
+    else
+        notfound "MinIO: Stopped"
     fi
 
     # Slot-specific services
@@ -805,8 +812,8 @@ show_all_slots_status() {
     echo "=== Happy Self-Hosted Status (All Slots) ==="
     echo ""
 
-    # Shared services (PostgreSQL and Redis)
-    echo "--- Shared Services ---"
+    # Docker infrastructure services
+    echo "--- Docker Infrastructure ---"
     if port_listening "$POSTGRES_PORT"; then
         success "PostgreSQL: Running (port $POSTGRES_PORT)"
     else
@@ -817,6 +824,12 @@ show_all_slots_status() {
         success "Redis: Running (port $REDIS_PORT)"
     else
         notfound "Redis: Stopped"
+    fi
+
+    if port_listening "$MINIO_PORT"; then
+        success "MinIO: Running (API: $MINIO_PORT, Console: $MINIO_CONSOLE_PORT)"
+    else
+        notfound "MinIO: Stopped"
     fi
     echo ""
 
@@ -846,17 +859,20 @@ show_logs() {
             tail -f "$LOG_DIR/webapp.log"
             ;;
         minio)
-            info "Showing MinIO logs (slot ${SLOT:-0})..."
-            tail -f "$LOG_DIR/minio.log"
+            info "Showing MinIO logs (docker)..."
+            docker compose -f "$SCRIPT_DIR/docker-compose.yaml" logs -f minio
             ;;
         postgres)
-            info "Showing PostgreSQL logs..."
-            tail -f /var/log/postgresql/postgresql-17-main.log 2>/dev/null || \
-                echo "PostgreSQL logs not found at standard location"
+            info "Showing PostgreSQL logs (docker)..."
+            docker compose -f "$SCRIPT_DIR/docker-compose.yaml" logs -f postgres
+            ;;
+        redis)
+            info "Showing Redis logs (docker)..."
+            docker compose -f "$SCRIPT_DIR/docker-compose.yaml" logs -f redis
             ;;
         *)
             error "Unknown service: $service"
-            echo "Available services: server, webapp, minio, postgres"
+            echo "Available services: server, webapp, postgres, redis, minio"
             exit 1
             ;;
     esac
@@ -1060,6 +1076,10 @@ case "${1:-}" in
         echo ""
         echo "Usage: $0 [--slot N] [--debug] <command> [options]"
         echo ""
+        echo "Prerequisites:"
+        echo "  - Docker (for PostgreSQL, Redis, MinIO infrastructure)"
+        echo "  - Node.js 24+ and Yarn (for happy-server and webapp)"
+        echo ""
         echo "Options:"
         echo "  --slot N    Use slot N for port/database isolation (default: 0)"
         echo "  --debug     Enable debug logging (DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING)"
@@ -1070,23 +1090,24 @@ case "${1:-}" in
         echo "  --slot 2            Test slot 2: Server=10011, Webapp=10012, DB=handy_test_2"
         echo "  --slot N            Ports = base + 10*(N-1), separate database per slot"
         echo ""
-        echo "Database Isolation:"
-        echo "  Each slot uses its own database (handy_test_N) to prevent test/prod conflicts."
-        echo "  PostgreSQL and Redis processes are shared, but data is isolated by database."
+        echo "Infrastructure:"
+        echo "  PostgreSQL, Redis, and MinIO run via docker compose (shared by all slots)."
+        echo "  Each slot uses its own database (handy_test_N) for isolation."
+        echo "  happy-server and webapp run from source (not containerized)."
         echo ""
         echo "Commands:"
-        echo "  start              Start all services (backend + webapp)"
-        echo "  start-backend      Start only backend (PostgreSQL, Redis, MinIO, happy-server)"
+        echo "  start              Start all services (docker infra + server + webapp)"
+        echo "  start-backend      Start only backend (docker infra + happy-server)"
         echo "  start-webapp       Start only the webapp"
-        echo "  stop               Stop happy-server, webapp, and MinIO (leaves databases running)"
-        echo "  cleanup            Stop ALL services including PostgreSQL and Redis"
+        echo "  stop               Stop happy-server and webapp (docker infra keeps running)"
+        echo "  cleanup            Stop ALL services including docker infrastructure"
         echo "  cleanup --clean-logs       Also delete log files"
         echo "  cleanup --all-slots        Clean all slots (not just current)"
         echo "  cleanup --nuke-happy-dir   Also delete HAPPY_HOME_DIR (~/.happy-slot-*)"
         echo "  restart            Full cleanup and restart all services"
         echo "  status             Show status of all services"
         echo "  status --all-slots Show status for all active slots"
-        echo "  logs <service>     Tail logs for a service (server, webapp, minio, postgres)"
+        echo "  logs <service>     Tail logs for a service (server, webapp)"
         echo "  monitor            Show status every 60 seconds (handles Ctrl-C gracefully)"
         echo "  env                Print environment variables for this slot (can be sourced)"
         echo "  cli [args]         Run happy CLI with local server configuration"
@@ -1094,9 +1115,10 @@ case "${1:-}" in
         echo "  urls               Show all service URLs and connection strings"
         echo "  help               Show this help message"
         echo ""
-        echo "Shared Services (not slot-specific):"
-        echo "  POSTGRES_PORT       PostgreSQL port (default: 5432)"
-        echo "  REDIS_PORT          Redis port (default: 6379)"
+        echo "Docker Infrastructure (shared, not slot-specific):"
+        echo "  PostgreSQL:  port 5432"
+        echo "  Redis:       port 6379"
+        echo "  MinIO:       port 9000 (API), 9001 (Console)"
         echo ""
         echo "Examples:"
         echo "  $0 start                    # Start slot 0 (default ports)"
@@ -1105,6 +1127,11 @@ case "${1:-}" in
         echo "  $0 status --all-slots       # Check status of all active slots"
         echo "  $0 --slot 1 env             # Print env vars for slot 1"
         echo "  eval \$($0 --slot 1 env)     # Set env vars in current shell"
+        echo ""
+        echo "Docker commands:"
+        echo "  docker compose up -d        # Start infrastructure only"
+        echo "  docker compose down         # Stop infrastructure"
+        echo "  docker compose down -v      # Stop and remove data volumes"
         echo ""
         ;;
 

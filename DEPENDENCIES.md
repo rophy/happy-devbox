@@ -7,20 +7,24 @@ This document lists all system and package dependencies required to run the Happ
 These must be installed on the host system:
 
 ### Required
+- **Docker** - For running PostgreSQL, Redis, and MinIO infrastructure
 - **Node.js 24+** - Runtime for all JavaScript/TypeScript code
 - **Yarn 1.22.22+** - Package manager (specified in package.json)
-- **PostgreSQL 17+** - Primary database
-- **Redis 7+** - Caching and pub/sub
-- **MinIO** - S3-compatible object storage
 
 ### Optional
 - **FFmpeg** - Required by happy-server for media processing
 - **Python3** - Required by happy-server for some operations
+- **psql** (PostgreSQL client) - For database migrations and debugging
 
 ## Installation Commands
 
 ### Ubuntu/Debian
 ```bash
+# Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+# Log out and back in for group changes to take effect
+
 # Node.js 24
 curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt-get install -y nodejs
@@ -28,25 +32,54 @@ sudo apt-get install -y nodejs
 # Yarn
 npm install -g yarn
 
-# PostgreSQL 17
-sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-sudo apt-get update
-sudo apt-get install -y postgresql-17
-
-# Redis
-sudo apt-get install -y redis-server
-
-# MinIO
-wget https://dl.min.io/server/minio/release/linux-amd64/minio
-chmod +x minio
-sudo mv minio /usr/local/bin/
-wget https://dl.min.io/client/mc/release/linux-amd64/mc
-chmod +x mc
-sudo mv mc /usr/local/bin/
+# Optional: PostgreSQL client (for migrations)
+sudo apt-get install -y postgresql-client
 
 # Optional: FFmpeg and Python3
 sudo apt-get install -y ffmpeg python3
+```
+
+### macOS
+```bash
+# Docker Desktop
+# Download from https://www.docker.com/products/docker-desktop
+
+# Node.js 24 (via Homebrew)
+brew install node@24
+
+# Yarn
+npm install -g yarn
+
+# Optional: PostgreSQL client
+brew install postgresql
+
+# Optional: FFmpeg and Python3
+brew install ffmpeg python3
+```
+
+## Infrastructure Services (via Docker)
+
+The following services run in Docker containers (managed by docker-compose.yaml):
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| PostgreSQL | postgres:17 | 5432 | Primary database |
+| Redis | redis:7-alpine | 6379 | Caching and pub/sub |
+| MinIO | minio/minio | 9000 (API), 9001 (Console) | S3-compatible object storage |
+
+Start infrastructure:
+```bash
+docker compose up -d
+```
+
+Stop infrastructure:
+```bash
+docker compose down
+```
+
+Stop and remove data:
+```bash
+docker compose down -v
 ```
 
 ## Package Dependencies
@@ -85,9 +118,9 @@ make install
 
 ## CI Dependencies
 
-The GitHub Actions CI workflow (`.github/workflows/ci.yml`) installs all dependencies automatically:
+The GitHub Actions CI workflow (`.github/workflows/ci.yml`) uses:
 1. Node.js 24 via `setup-node` action
-2. PostgreSQL 17 and Redis 7 via Docker services
+2. PostgreSQL 17 and Redis 7 via Docker services (same as local docker-compose)
 3. MinIO server and client downloaded during workflow
 4. Playwright for browser automation testing
 5. All package dependencies via `yarn install --frozen-lockfile`
