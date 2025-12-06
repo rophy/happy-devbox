@@ -1,0 +1,66 @@
+FROM node:24-trixie
+
+# Install basic development tools and iptables/ipset
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  less \
+  git \
+  procps \
+  sudo \
+  fzf \
+  zsh \
+  man-db \
+  unzip \
+  gnupg2 \
+  gh \
+  iptables \
+  ipset \
+  iproute2 \
+  dnsutils \
+  aggregate \
+  jq \
+  nano \
+  vim \
+  wget \
+  tini \
+  curl \
+  python3 python3-pip python-is-python3 python3-venv
+  # [RRN ] Don't clean because we want to keep apt and I don't mind if claude
+  # installs either:
+  # && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Grant node user passwordless sudo privileges
+RUN echo "node ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/node \
+    && chmod 0440 /etc/sudoers.d/node
+
+# Set `DEVCONTAINER` environment variable to help with orientation
+ENV DEVCONTAINER=true
+
+# End shared, non-project configuration.
+
+# Install MinIO client (mc) for bucket management
+# RUN wget -q https://dl.min.io/client/mc/release/linux-amd64/mc \
+#     && chmod +x mc \
+#     && mv mc /usr/local/bin/
+# Update: MinIO is dead, use s5cmd.
+RUN  wget https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
+    && tar xvf s5cmd_2.3.0_Linux-64bit.tar.gz -C /usr/local/bin/ s5cmd \
+    && rm -f s5cmd_2.3.0_Linux-64bit.tar.gz
+
+# Claude
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+
+# Expose ports for Happy services
+# happy-server API
+EXPOSE 3005
+# happy web client (Expo)
+EXPOSE 8081
+
+USER node
+WORKDIR /workspace
+# Without this, docker volume will be owned by root.
+RUN mkdir -p /home/node/.claude \
+    && echo 'alias claude="claude --dangerously-skip-permissions"' >> /home/node/.bashrc
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash"]

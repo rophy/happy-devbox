@@ -1,0 +1,93 @@
+# Infrastructure services for happy-devbox
+# Devcontainer is included as a service to share the network
+#
+# Usage:
+#   docker compose up -d          # Start all infrastructure
+#   docker compose down           # Stop all infrastructure
+#   docker compose down -v        # Stop and remove data volumes
+
+services:
+  dev:
+    build:
+      context: .devcontainer
+      dockerfile: Dockerfile.happy
+      args:
+        CLAUDE_CODE_VERSION: latest
+    volumes:
+      - .:/workspace
+      - claude-code-bashhistory:/commandhistory
+      - claude-code-config:/home/node/.claude
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      CLAUDE_CONFIG_DIR: "/home/node/.claude"
+      POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/handy"
+      REDIS_URL: "redis://redis:6379"
+      S3_HOST: s3mock
+      S3_PORT: "9000"
+      S3_USE_SSL: "false"
+      S3_ACCESS_KEY: happy
+      S3_SECRET_KEY: coder
+      S3_PUBLIC_URL: http://s3mock:9000/happy
+      # s5cmd
+      S3_ENDPOINT_URL: http://s3mock:9000
+      AWS_ACCESS_KEY_ID: happy
+      AWS_SECRET_ACCESS_KEY: coder
+
+    ports:
+      - "3005:3005"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3mock:
+        condition: service_healthy
+    command: sleep infinity
+    tty: true
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: handy
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 1
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 1
+
+  s3mock:
+    build:
+      context: .devcontainer
+      dockerfile: Dockerfile.s3
+    environment:
+      AWS_ACCESS_KEY_ID: happy
+      AWS_SECRET_ACCESS_KEY: coder
+    volumes:
+      - s3_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "s5cmd --json ls"]
+      interval: 10s
+      timeout: 5s
+      retries: 1
+volumes:
+  postgres_data:
+  redis_data:
+  s3_data:
+  claude-code-bashhistory:
+  claude-code-config:

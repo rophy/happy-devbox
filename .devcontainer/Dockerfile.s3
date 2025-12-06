@@ -1,0 +1,12 @@
+FROM rclone/rclone:1.72
+
+RUN apk add --no-cache bash tini \
+    && wget https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
+    && tar xvf s5cmd_2.3.0_Linux-64bit.tar.gz -C /usr/local/bin/ s5cmd \
+    && rm -f s5cmd_2.3.0_Linux-64bit.tar.gz \
+    && mkdir -p happy
+
+ENV S3_ENDPOINT_URL=http://localhost:9000
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["bash", "-c", "rclone serve s3 --addr :9000 --auth-key $AWS_ACCESS_KEY_ID,$AWS_SECRET_ACCESS_KEY /data"]
