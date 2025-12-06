@@ -7,8 +7,17 @@ This will require figuring out how to build the respective components,
 and possibly adding flags to get them to expose a self-hosted mode
 rather than connecting to the happy.engineering server
 
-Install whatever dependencies you want with `apt-get install`, `npm`,
-etc, but document what you install in DEPENDENCIES.md.
+Dev Container
+================================================================================
+You should be running in a dev container. To verify, env var $DEVCONTAINER
+should be set to "true".
+
+If you found that you're not running in a dev container, STOP and ask user if
+this is expected.
+
+Once you confirmed you're running in dev container, install whatever
+dependencies you want with `apt-get install`, `npm`, etc, but document what you
+install in DEPENDENCIES.md.
 
 CODING STYLE
 ================================================================================
