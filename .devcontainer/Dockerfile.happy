@@ -35,20 +35,19 @@ RUN echo "node ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/node \
 # Set `DEVCONTAINER` environment variable to help with orientation
 ENV DEVCONTAINER=true
 
-# End shared, non-project configuration.
+# Playwright for E2E tests
+RUN npm install -g playwright \
+    && npx playwright install chromium \
+    && npx playwright install-deps chromium
 
-# Install MinIO client (mc) for bucket management
-# RUN wget -q https://dl.min.io/client/mc/release/linux-amd64/mc \
-#     && chmod +x mc \
-#     && mv mc /usr/local/bin/
-# Update: MinIO is dead, use s5cmd.
+# MinIO is dead, use s5cmd as CLI.
 RUN  wget https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
     && tar xvf s5cmd_2.3.0_Linux-64bit.tar.gz -C /usr/local/bin/ s5cmd \
     && rm -f s5cmd_2.3.0_Linux-64bit.tar.gz
 
-# Claude
+# cluade and happy-coder
 ARG CLAUDE_CODE_VERSION=latest
-RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} happy-coder
 
 # Expose ports for Happy services
 # happy-server API

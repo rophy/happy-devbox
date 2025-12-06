@@ -30,6 +30,24 @@
 
 set -e
 
+# =============================================================================
+# Devcontainer Requirement
+# =============================================================================
+# This script must run inside the devcontainer where docker-compose provides
+# infrastructure services (postgres, redis, s3mock) on their respective hostnames.
+
+if [[ -z "${DEVCONTAINER:-}" ]]; then
+    echo "ERROR: happy-launcher.sh must be run inside the devcontainer." >&2
+    echo "" >&2
+    echo "The devcontainer provides infrastructure services (PostgreSQL, Redis, S3)" >&2
+    echo "via docker-compose. Please start the devcontainer first:" >&2
+    echo "" >&2
+    echo "    docker compose up -d" >&2
+    echo "    docker compose exec dev bash" >&2
+    echo "" >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$SCRIPT_DIR/happy-server"
 CLI_DIR="$SCRIPT_DIR/happy-cli"
@@ -177,6 +195,15 @@ calculate_ports() {
 # Apply slot configuration
 calculate_ports "${SLOT:-0}"
 
+# =============================================================================
+# Infrastructure Service Configuration (docker-compose)
+# =============================================================================
+# Services are provided by docker-compose on their respective hostnames.
+
+POSTGRES_HOST="${POSTGRES_HOST:-postgres}"
+REDIS_HOST="${REDIS_HOST:-redis}"
+S3_HOST="${S3_HOST:-s3mock}"
+
 # These ports are shared (system services) - not affected by slots
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 REDIS_PORT="${REDIS_PORT:-6379}"
@@ -200,7 +227,8 @@ if [[ "${SLOT:-0}" -eq 0 ]]; then
 else
     DATABASE_NAME="handy_test_${SLOT}"
 fi
-DATABASE_URL="postgresql://postgres:postgres@localhost:${POSTGRES_PORT}/${DATABASE_NAME}"
+DATABASE_URL="postgresql://postgres:postgres@${POSTGRES_HOST}:${POSTGRES_PORT}/${DATABASE_NAME}"
+REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}"
 
 # =============================================================================
 # Colors and helpers
@@ -236,14 +264,15 @@ is_slot_service_running() {
     return 1
 }
 
-# Check if a port is listening
+# Check if a port is listening on a given host (default: localhost)
 port_listening() {
     local port=$1
+    local host=${2:-localhost}
     # Try bash /dev/tcp first (works for any TCP port)
-    (echo > /dev/tcp/localhost/"$port") 2>/dev/null && return 0
+    (echo > /dev/tcp/"$host"/"$port") 2>/dev/null && return 0
     # Fallback to curl for HTTP services
-    curl -s --max-time 1 "http://localhost:${port}" > /dev/null 2>&1 && return 0
-    curl -s --max-time 1 "http://localhost:${port}/health" > /dev/null 2>&1 && return 0
+    curl -s --max-time 1 "http://${host}:${port}" > /dev/null 2>&1 && return 0
+    curl -s --max-time 1 "http://${host}:${port}/health" > /dev/null 2>&1 && return 0
     return 1
 }
 
@@ -280,16 +309,18 @@ get_active_slots() {
     printf '%s\n' "${slots[@]}" | sort -n | uniq
 }
 
-# Wait for a port to become available
+# Wait for a port to become available on a given host
+# Usage: wait_for_port <port> <name> [max_attempts] [host]
 wait_for_port() {
     local port=$1
     local name=$2
     local max_attempts=${3:-30}
+    local host=${4:-localhost}
     local attempt=1
 
-    echo -n "  Waiting for $name on port $port"
+    echo -n "  Waiting for $name on $host:$port"
     while [ $attempt -le $max_attempts ]; do
-        if port_listening "$port"; then
+        if port_listening "$port" "$host"; then
             echo " - ready!"
             return 0
         fi
@@ -306,97 +337,55 @@ wait_for_port() {
 # =============================================================================
 
 ensure_postgres_ready() {
-    # Ensure postgres user has expected password
-    sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'postgres';" > /dev/null 2>&1 || true
-
     # Ensure slot-specific database exists
     # - Slot 0: 'handy' (production)
     # - Slot N: 'handy_test_N' (isolated test databases)
-    if ! PGPASSWORD=postgres psql -U postgres -h localhost -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$DATABASE_NAME"; then
+    if ! PGPASSWORD=postgres psql -U postgres -h "$POSTGRES_HOST" -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$DATABASE_NAME"; then
         info "Creating database '$DATABASE_NAME' for slot ${SLOT:-0}..."
-        sudo -u postgres psql -c "CREATE DATABASE $DATABASE_NAME;" > /dev/null 2>&1 || true
+        PGPASSWORD=postgres psql -U postgres -h "$POSTGRES_HOST" -c "CREATE DATABASE $DATABASE_NAME;" > /dev/null 2>&1 || true
     fi
 
     # Ensure database schema exists (run migrations if needed)
-    if ! PGPASSWORD=postgres psql -U postgres -h localhost -d "$DATABASE_NAME" -c "\dt" 2>/dev/null | grep -q "Session"; then
+    if ! PGPASSWORD=postgres psql -U postgres -h "$POSTGRES_HOST" -d "$DATABASE_NAME" -c "\dt" 2>/dev/null | grep -q "Session"; then
         info "Running database migrations for '$DATABASE_NAME'..."
         (cd "$SERVER_DIR" && DATABASE_URL="$DATABASE_URL" yarn migrate > /dev/null 2>&1) || true
     fi
 }
 
 start_postgres() {
-    # Check if port is already listening (e.g., via Docker/CI service)
-    if port_listening "$POSTGRES_PORT"; then
-        info "PostgreSQL is already running on port $POSTGRES_PORT"
-        ensure_postgres_ready
-        return 0
+    # PostgreSQL is provided by docker-compose, just verify it's accessible
+    info "Checking PostgreSQL (docker-compose service)..."
+    if ! wait_for_port "$POSTGRES_PORT" "PostgreSQL" 30 "$POSTGRES_HOST"; then
+        error "PostgreSQL not available at $POSTGRES_HOST:$POSTGRES_PORT"
+        error "Ensure docker-compose services are running: docker compose up -d"
+        return 1
     fi
-    if is_running "postgres.*17/main"; then
-        info "PostgreSQL process detected, waiting for port..."
-        wait_for_port "$POSTGRES_PORT" "PostgreSQL" 10 || {
-            error "PostgreSQL process running but port not responding"
-            return 1
-        }
-    else
-        info "Starting PostgreSQL..."
-        service postgresql start 2>/dev/null || {
-            error "Failed to start PostgreSQL service"
-            return 1
-        }
-        wait_for_port "$POSTGRES_PORT" "PostgreSQL" 10 || {
-            error "PostgreSQL failed to start"
-            return 1
-        }
-        ensure_postgres_ready
-        success "PostgreSQL started on port $POSTGRES_PORT"
-    fi
+    ensure_postgres_ready
+    success "PostgreSQL ready at $POSTGRES_HOST:$POSTGRES_PORT (database: $DATABASE_NAME)"
 }
 
 start_redis() {
-    # Check if port is already listening (e.g., via Docker/CI service)
-    if port_listening "$REDIS_PORT"; then
-        info "Redis is already running on port $REDIS_PORT"
-        return 0
+    # Redis is provided by docker-compose, just verify it's accessible
+    info "Checking Redis (docker-compose service)..."
+    if ! wait_for_port "$REDIS_PORT" "Redis" 30 "$REDIS_HOST"; then
+        error "Redis not available at $REDIS_HOST:$REDIS_PORT"
+        error "Ensure docker-compose services are running: docker compose up -d"
+        return 1
     fi
-    if is_running "redis-server"; then
-        info "Redis process detected, waiting for port..."
-        wait_for_port "$REDIS_PORT" "Redis" 10 || {
-            error "Redis process running but port not responding"
-            return 1
-        }
-    else
-        info "Starting Redis..."
-        redis-server --daemonize yes --port "$REDIS_PORT" 2>/dev/null || \
-            service redis-server start 2>/dev/null || true
-        wait_for_port "$REDIS_PORT" "Redis" 10 || {
-            error "Redis failed to start"
-            return 1
-        }
-        success "Redis started on port $REDIS_PORT"
-    fi
+    success "Redis ready at $REDIS_HOST:$REDIS_PORT"
 }
 
 start_minio() {
-    if port_listening "$MINIO_PORT"; then
-        info "MinIO is already running on port $MINIO_PORT"
-    else
-        info "Starting MinIO (slot ${SLOT:-0})..."
-        mkdir -p "$MINIO_DATA_DIR/data"
-        MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            minio server "$MINIO_DATA_DIR/data" --address ":${MINIO_PORT}" --console-address ":${MINIO_CONSOLE_PORT}" \
-            > "$LOG_DIR/minio.log" 2>&1 &
-        echo $! > "$PIDS_DIR/minio.pid"
-        wait_for_port "$MINIO_PORT" "MinIO" 15 || {
-            error "MinIO failed to start"
-            return 1
-        }
-        # Create bucket if mc is available
-        if command -v mc >/dev/null 2>&1; then
-            mc alias set "local-slot-${SLOT_SUFFIX}" "http://localhost:${MINIO_PORT}" minioadmin minioadmin 2>/dev/null || true
-            mc mb "local-slot-${SLOT_SUFFIX}/happy" 2>/dev/null || true
-        fi
-        success "MinIO started on port $MINIO_PORT (Console: $MINIO_CONSOLE_PORT)"
+    # S3 is provided by docker-compose (s3mock service), just verify it's accessible
+    # Note: In docker-compose, S3 is on port 9000 regardless of slot
+    local s3_port="${S3_PORT:-9000}"
+    info "Checking S3 (docker-compose service)..."
+    if ! wait_for_port "$s3_port" "S3" 30 "$S3_HOST"; then
+        error "S3 not available at $S3_HOST:$s3_port"
+        error "Ensure docker-compose services are running: docker compose up -d"
+        return 1
     fi
+    success "S3 ready at $S3_HOST:$s3_port"
 }
 
 start_server() {
@@ -421,19 +410,21 @@ start_server() {
 
         # Start server with environment variables for ports
         # DATABASE_URL uses slot-specific database for test isolation
+        # S3 credentials match docker-compose.yaml (happy/coder)
+        local s3_port="${S3_PORT:-9000}"
         env $debug_env \
         PORT="$HAPPY_SERVER_PORT" \
         METRICS_PORT="$METRICS_PORT" \
         DATABASE_URL="$DATABASE_URL" \
-        REDIS_URL="redis://localhost:${REDIS_PORT}" \
+        REDIS_URL="$REDIS_URL" \
         HANDY_MASTER_SECRET="test-secret-for-local-development" \
-        S3_HOST="localhost" \
-        S3_PORT="$MINIO_PORT" \
+        S3_HOST="$S3_HOST" \
+        S3_PORT="$s3_port" \
         S3_USE_SSL="false" \
-        S3_ACCESS_KEY="minioadmin" \
-        S3_SECRET_KEY="minioadmin" \
+        S3_ACCESS_KEY="${S3_ACCESS_KEY:-happy}" \
+        S3_SECRET_KEY="${S3_SECRET_KEY:-coder}" \
         S3_BUCKET="happy" \
-        S3_PUBLIC_URL="http://localhost:${MINIO_PORT}/happy" \
+        S3_PUBLIC_URL="http://${S3_HOST}:${s3_port}/happy" \
             yarn start > "$LOG_DIR/server.log" 2>&1 &
         echo $! > "$PIDS_DIR/server.pid"
         cd "$SCRIPT_DIR"
@@ -503,9 +494,9 @@ stop_all() {
         fi
     done
 
-    # Note: Not stopping PostgreSQL and Redis as they're system services
-    warning "PostgreSQL and Redis are system services and were not stopped"
-    warning "To stop them manually: service postgresql stop && service redis-server stop"
+    # Note: PostgreSQL, Redis, and S3 are docker-compose services, not managed here
+    info "Infrastructure services (PostgreSQL, Redis, S3) are managed by docker-compose"
+    info "To stop them: docker compose stop"
 }
 
 cleanup_slot() {
@@ -627,32 +618,13 @@ cleanup_all() {
         success "happy-server stopped"
     fi
 
-    # Stop any remaining MinIO processes
-    if is_running "minio server"; then
-        info "Stopping MinIO..."
-        pkill -f "minio server" || true
-        success "MinIO stopped"
-    fi
-
-    # Stop PostgreSQL
-    if is_running "postgres.*17/main"; then
-        info "Stopping PostgreSQL..."
-        service postgresql stop || true
-        success "PostgreSQL stopped"
-    fi
-
-    # Stop Redis
-    if is_running "redis-server"; then
-        info "Stopping Redis..."
-        service redis-server stop || true
-        pkill -f "redis-server" 2>/dev/null || true
-        success "Redis stopped"
-    fi
-
     # Kill any orphaned processes
     info "Cleaning up any orphaned processes..."
     pkill -f "node.*happy-server" 2>/dev/null || true
     pkill -f "node.*happy-cli" 2>/dev/null || true
+
+    # Note: PostgreSQL, Redis, and S3 are docker-compose services
+    info "Infrastructure services (PostgreSQL, Redis, S3) are managed by docker-compose"
 
     echo ""
     success "Complete cleanup finished!"
@@ -715,19 +687,6 @@ show_slot_services_status() {
         return 1
     }
 
-    # MinIO (slot-specific)
-    if local_is_slot_service_running "minio"; then
-        if port_listening "$minio_port"; then
-            success "  MinIO: Running (API: $minio_port, Console: $minio_console_port)"
-        else
-            warning "  MinIO: Process exists but port not responding"
-        fi
-    elif port_listening "$minio_port"; then
-        success "  MinIO: Running (API: $minio_port, Console: $minio_console_port)"
-    else
-        notfound "  MinIO: Stopped"
-    fi
-
     # happy-server (slot-specific)
     if local_is_slot_service_running "server"; then
         if port_listening "$server_port"; then
@@ -769,28 +728,35 @@ show_status() {
     echo "  Name:     $DATABASE_NAME"
     echo "  URL:      $DATABASE_URL"
     echo ""
-    echo "Shared services (all slots use same Postgres/Redis process):"
-    echo "  Postgres: $POSTGRES_PORT"
-    echo "  Redis:    $REDIS_PORT"
+    echo "Infrastructure (docker-compose services):"
+    echo "  Postgres: $POSTGRES_HOST:$POSTGRES_PORT"
+    echo "  Redis:    $REDIS_HOST:$REDIS_PORT"
+    echo "  S3:       $S3_HOST:${S3_PORT:-9000}"
     echo ""
     echo "Directories:"
-    echo "  MinIO data: $MINIO_DATA_DIR"
     echo "  Logs:       $LOG_DIR"
     echo "  PIDs:       $PIDS_DIR"
     echo ""
 
-    # Shared services (PostgreSQL and Redis)
-    echo "--- Shared Services ---"
-    if port_listening "$POSTGRES_PORT"; then
-        success "PostgreSQL: Running (port $POSTGRES_PORT, database: $DATABASE_NAME)"
+    # Shared services (PostgreSQL, Redis, S3 from docker-compose)
+    echo "--- Infrastructure Services (docker-compose) ---"
+    if port_listening "$POSTGRES_PORT" "$POSTGRES_HOST"; then
+        success "PostgreSQL: Running ($POSTGRES_HOST:$POSTGRES_PORT, database: $DATABASE_NAME)"
     else
-        notfound "PostgreSQL: Stopped"
+        notfound "PostgreSQL: Not accessible at $POSTGRES_HOST:$POSTGRES_PORT"
     fi
 
-    if port_listening "$REDIS_PORT"; then
-        success "Redis: Running (port $REDIS_PORT, shared)"
+    if port_listening "$REDIS_PORT" "$REDIS_HOST"; then
+        success "Redis: Running ($REDIS_HOST:$REDIS_PORT)"
     else
-        notfound "Redis: Stopped"
+        notfound "Redis: Not accessible at $REDIS_HOST:$REDIS_PORT"
+    fi
+
+    local s3_port="${S3_PORT:-9000}"
+    if port_listening "$s3_port" "$S3_HOST"; then
+        success "S3: Running ($S3_HOST:$s3_port)"
+    else
+        notfound "S3: Not accessible at $S3_HOST:$s3_port"
     fi
 
     # Slot-specific services
@@ -805,18 +771,25 @@ show_all_slots_status() {
     echo "=== Happy Self-Hosted Status (All Slots) ==="
     echo ""
 
-    # Shared services (PostgreSQL and Redis)
-    echo "--- Shared Services ---"
-    if port_listening "$POSTGRES_PORT"; then
-        success "PostgreSQL: Running (port $POSTGRES_PORT)"
+    # Infrastructure services (docker-compose)
+    echo "--- Infrastructure Services (docker-compose) ---"
+    if port_listening "$POSTGRES_PORT" "$POSTGRES_HOST"; then
+        success "PostgreSQL: Running ($POSTGRES_HOST:$POSTGRES_PORT)"
     else
-        notfound "PostgreSQL: Stopped"
+        notfound "PostgreSQL: Not accessible at $POSTGRES_HOST:$POSTGRES_PORT"
     fi
 
-    if port_listening "$REDIS_PORT"; then
-        success "Redis: Running (port $REDIS_PORT)"
+    if port_listening "$REDIS_PORT" "$REDIS_HOST"; then
+        success "Redis: Running ($REDIS_HOST:$REDIS_PORT)"
     else
-        notfound "Redis: Stopped"
+        notfound "Redis: Not accessible at $REDIS_HOST:$REDIS_PORT"
+    fi
+
+    local s3_port="${S3_PORT:-9000}"
+    if port_listening "$s3_port" "$S3_HOST"; then
+        success "S3: Running ($S3_HOST:$s3_port)"
+    else
+        notfound "S3: Not accessible at $S3_HOST:$s3_port"
     fi
     echo ""
 
@@ -845,18 +818,13 @@ show_logs() {
             info "Showing webapp logs (slot ${SLOT:-0})..."
             tail -f "$LOG_DIR/webapp.log"
             ;;
-        minio)
-            info "Showing MinIO logs (slot ${SLOT:-0})..."
-            tail -f "$LOG_DIR/minio.log"
-            ;;
-        postgres)
-            info "Showing PostgreSQL logs..."
-            tail -f /var/log/postgresql/postgresql-17-main.log 2>/dev/null || \
-                echo "PostgreSQL logs not found at standard location"
-            ;;
         *)
             error "Unknown service: $service"
-            echo "Available services: server, webapp, minio, postgres"
+            echo "Available services: server, webapp"
+            echo "Note: Infrastructure logs (postgres, redis, s3) are in docker-compose:"
+            echo "  docker compose logs postgres"
+            echo "  docker compose logs redis"
+            echo "  docker compose logs s3mock"
             exit 1
             ;;
     esac
@@ -864,33 +832,36 @@ show_logs() {
 
 # Print environment variables for this slot (can be sourced)
 print_env() {
+    local s3_port="${S3_PORT:-9000}"
     cat << EOF
 export HAPPY_SERVER_PORT=$HAPPY_SERVER_PORT
 export HAPPY_WEBAPP_PORT=$HAPPY_WEBAPP_PORT
 export HAPPY_SERVER_URL=$HAPPY_SERVER_URL
 export HAPPY_WEBAPP_URL=$HAPPY_WEBAPP_URL
 export HAPPY_HOME_DIR=~/.happy-slot-${SLOT_SUFFIX}
-export HAPPY_MINIO_PORT=$MINIO_PORT
-export HAPPY_MINIO_CONSOLE_PORT=$MINIO_CONSOLE_PORT
 export HAPPY_METRICS_PORT=$METRICS_PORT
 export DATABASE_URL=$DATABASE_URL
 export DATABASE_NAME=$DATABASE_NAME
+export REDIS_URL=$REDIS_URL
+export S3_HOST=$S3_HOST
+export S3_PORT=$s3_port
 EOF
 }
 
 show_urls() {
+    local s3_port="${S3_PORT:-9000}"
     echo ""
     echo "=== Service URLs ==="
     echo ""
     echo "  happy-server:    $HAPPY_SERVER_URL/"
     echo "  Webapp:          $HAPPY_WEBAPP_URL/"
-    echo "  MinIO Console:   http://localhost:${MINIO_CONSOLE_PORT}/"
     echo ""
-    echo "=== Database Connections ==="
+    echo "=== Infrastructure (docker-compose) ==="
     echo ""
     echo "  PostgreSQL:      $DATABASE_URL"
     echo "  Database:        $DATABASE_NAME"
-    echo "  Redis:           redis://localhost:${REDIS_PORT}"
+    echo "  Redis:           $REDIS_URL"
+    echo "  S3:              http://${S3_HOST}:${s3_port}"
     echo ""
 }
 
@@ -1058,6 +1029,9 @@ case "${1:-}" in
         echo ""
         echo "Happy Self-Hosted Service Launcher"
         echo ""
+        echo "IMPORTANT: This script must run inside the devcontainer."
+        echo "Infrastructure services (PostgreSQL, Redis, S3) are provided by docker-compose."
+        echo ""
         echo "Usage: $0 [--slot N] [--debug] <command> [options]"
         echo ""
         echo "Options:"
@@ -1072,21 +1046,21 @@ case "${1:-}" in
         echo ""
         echo "Database Isolation:"
         echo "  Each slot uses its own database (handy_test_N) to prevent test/prod conflicts."
-        echo "  PostgreSQL and Redis processes are shared, but data is isolated by database."
+        echo "  PostgreSQL, Redis, and S3 services are shared (docker-compose), but data is isolated."
         echo ""
         echo "Commands:"
-        echo "  start              Start all services (backend + webapp)"
-        echo "  start-backend      Start only backend (PostgreSQL, Redis, MinIO, happy-server)"
+        echo "  start              Start all services (verifies infra + starts server + webapp)"
+        echo "  start-backend      Start only backend (verifies infra + starts happy-server)"
         echo "  start-webapp       Start only the webapp"
-        echo "  stop               Stop happy-server, webapp, and MinIO (leaves databases running)"
-        echo "  cleanup            Stop ALL services including PostgreSQL and Redis"
+        echo "  stop               Stop happy-server and webapp"
+        echo "  cleanup            Stop happy-server and webapp, clean up PID files"
         echo "  cleanup --clean-logs       Also delete log files"
         echo "  cleanup --all-slots        Clean all slots (not just current)"
         echo "  cleanup --nuke-happy-dir   Also delete HAPPY_HOME_DIR (~/.happy-slot-*)"
-        echo "  restart            Full cleanup and restart all services"
+        echo "  restart            Stop and restart all services"
         echo "  status             Show status of all services"
         echo "  status --all-slots Show status for all active slots"
-        echo "  logs <service>     Tail logs for a service (server, webapp, minio, postgres)"
+        echo "  logs <service>     Tail logs for a service (server, webapp)"
         echo "  monitor            Show status every 60 seconds (handles Ctrl-C gracefully)"
         echo "  env                Print environment variables for this slot (can be sourced)"
         echo "  cli [args]         Run happy CLI with local server configuration"
@@ -1094,11 +1068,14 @@ case "${1:-}" in
         echo "  urls               Show all service URLs and connection strings"
         echo "  help               Show this help message"
         echo ""
-        echo "Shared Services (not slot-specific):"
-        echo "  POSTGRES_PORT       PostgreSQL port (default: 5432)"
-        echo "  REDIS_PORT          Redis port (default: 6379)"
+        echo "Infrastructure (docker-compose, not managed by this script):"
+        echo "  PostgreSQL:  $POSTGRES_HOST:$POSTGRES_PORT"
+        echo "  Redis:       $REDIS_HOST:$REDIS_PORT"
+        echo "  S3:          $S3_HOST:${S3_PORT:-9000}"
         echo ""
         echo "Examples:"
+        echo "  docker compose up -d        # Start infrastructure (run from host)"
+        echo "  docker compose exec dev bash  # Enter devcontainer"
         echo "  $0 start                    # Start slot 0 (default ports)"
         echo "  $0 --slot 1 start           # Start slot 1 (test ports)"
         echo "  $0 --slot 1 status          # Check slot 1 status"
